@@ -1,1 +1,184 @@
+"""
+Backend API for the Personal Finance Chatbot (IBM 3.2-2B-Instruct + HuggingFace)
+This file provides REST endpoints for a frontend such as Streamlit to interact with.
 
+Core Features:
+  - Exposes /chat, /budget-summary, and /spending-insights endpoints.
+  - Routes requests to IBM or Hugging Face models based on client input.
+  - Provides demographic-aware prompt construction.
+  - Logs minimal session context for continuity.
+
+Run locally:
+  1. pip install fastapi uvicorn requests python-dotenv
+  2. uvicorn backend_app:app --reload
+
+Environment variables:
+  IBM_API_URL     -> IBM model endpoint URL (e.g., https://api.us-south.generative-ibm.example/v1)
+  IBM_API_KEY     -> IBM API key
+  HUGGINGFACE_TOKEN -> Hugging Face token (optional)
+
+Endpoints:
+  POST /chat               : main conversational endpoint
+  POST /budget-summary     : structured budget summary generation
+  POST /spending-insights  : spending optimization suggestions
+
+Example request:
+  curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "How do I save taxes?", "demographic": "student"}'
+"""
+
+import os
+import json
+from typing import Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Environment setup
+IBM_API_URL = os.getenv("IBM_API_URL", "")
+IBM_API_KEY = os.getenv("IBM_API_KEY", "")
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+
+# Initialize app
+app = FastAPI(title="Personal Finance Chatbot Backend", version="1.0")
+
+# ----- Prompt definitions -----
+PROMPT_BASE = (
+    "You are an intelligent personal finance assistant using IBM generative AI. "
+    "Provide accurate, friendly, and helpful answers to help users manage savings, taxes, and investments."
+)
+
+DEMOGRAPHIC_GUIDANCE = {
+    "student": "Use simpler language, examples about student life, and practical, low-budget tips.",
+    "professional": "Use professional tone and concise business-relevant examples.",
+}
+
+PROMPT_ACTIONS = {
+    "budget_summary": "Generate a labeled monthly budget summary with recommended savings and 3 improvement tips.",
+    "spending_insights": "Analyze spending list and return 3 practical tips to optimize expenses.",
+}
+
+# ----- Models -----
+class ChatRequest(BaseModel):
+    message: str
+    demographic: str = "professional"
+    backend: str = "ibm"
+    context: str | None = None
+    profile: Dict[str, Any] | None = None
+
+class ChatResponse(BaseModel):
+    response: str
+
+# ----- Helper functions -----
+
+def build_prompt(req: ChatRequest, system_instruction: str = "") -> str:
+    demographic_text = DEMOGRAPHIC_GUIDANCE.get(req.demographic, "")
+    profile_text = ""
+    if req.profile:
+        pairs = [f"{k}: {v}" for k, v in req.profile.items() if v]
+        if pairs:
+            profile_text = "User profile: " + ", ".join(pairs) + "."
+
+    parts = [PROMPT_BASE, demographic_text]
+    if system_instruction:
+        parts.append(system_instruction)
+    if profile_text:
+        parts.append(profile_text)
+    parts.append(f"User message: {req.message}")
+    if req.context:
+        parts.append(f"Conversation context: {req.context}")
+
+    return "\n\n".join(p for p in parts if p)
+
+
+def call_ibm_model(prompt: str, model: str = "ibm-3.2-2b-instruct", temperature: float = 0.2) -> str:
+    if not IBM_API_URL or not IBM_API_KEY:
+        return "ERROR: IBM API credentials not configured."
+
+    headers = {
+        "Authorization": f"Bearer {IBM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "input": prompt,
+        "temperature": temperature,
+    }
+    try:
+        res = requests.post(IBM_API_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        # Generic fallback JSON traversal
+        if isinstance(data, dict):
+            for key in ["output", "result", "text", "generated_text", "choices"]:
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, list) and val:
+                        first = val[0]
+                        if isinstance(first, dict) and "text" in first:
+                            return first["text"].strip()
+                        return str(val[0])
+                    if isinstance(val, str):
+                        return val.strip()
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"IBM API error: {e}")
+
+
+def call_huggingface_model(prompt: str, model: str = "google/flan-t5-large", max_length: int = 512) -> str:
+    if not HF_TOKEN:
+        return "ERROR: Hugging Face token not configured."
+
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_length}}
+    try:
+        res = requests.post(f"https://api-inference.huggingface.co/models/{model}", headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        out = res.json()
+        if isinstance(out, list) and out and isinstance(out[0], dict) and "generated_text" in out[0]:
+            return out[0]["generated_text"].strip()
+        return json.dumps(out, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hugging Face API error: {e}")
+
+# ----- Endpoints -----
+
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(req: ChatRequest):
+    prompt = build_prompt(req)
+    if req.backend == "ibm":
+        result = call_ibm_model(prompt)
+    else:
+        result = call_huggingface_model(prompt)
+    return ChatResponse(response=result)
+
+
+@app.post("/budget-summary", response_model=ChatResponse)
+def budget_summary(req: ChatRequest):
+    system_instruction = PROMPT_ACTIONS["budget_summary"]
+    prompt = build_prompt(req, system_instruction)
+    if req.backend == "ibm":
+        result = call_ibm_model(prompt)
+    else:
+        result = call_huggingface_model(prompt)
+    return ChatResponse(response=result)
+
+
+@app.post("/spending-insights", response_model=ChatResponse)
+def spending_insights(req: ChatRequest):
+    system_instruction = PROMPT_ACTIONS["spending_insights"]
+    prompt = build_prompt(req, system_instruction)
+    if req.backend == "ibm":
+        result = call_ibm_model(prompt)
+    else:
+        result = call_huggingface_model(prompt)
+    return ChatResponse(response=result)
+
+# ----- Root -----
+
+@app.get("/")
+def root():
+    return {"message": "Personal Finance Chatbot Backend active", "ibm_configured": bool(IBM_API_URL and IBM_API_KEY)}
